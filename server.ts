@@ -5,16 +5,145 @@
 // no `sendMail`, and no `messages.send` call anywhere in this codebase —
 // drafting only writes to the account's own Drafts folder via IMAP APPEND,
 // and escalation only creates an internal bb task. See README.md.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
 
-import { appendDraft, pollInbox } from "./lib/imap";
+import { appendDraft, fetchMessageBody, pollInbox } from "./lib/imap";
 import { buildDigest, formatDigestText, type DigestMessage } from "./lib/digest";
 import { buildRawEmail, replySubject } from "./lib/mime";
-import { triage, type Rule, type RuleAction, type RuleUrgency, type RuleMatchType } from "./lib/rules";
+import { matchesRule, triage, type Rule, type RuleAction, type RuleUrgency, type RuleMatchType } from "./lib/rules";
 import { createEscalationTask } from "./lib/tasksCli";
+
+const matchTypeSchema = z.enum(["from", "domain", "subject-contains", "list-id"]);
+const actionSchema = z.enum(["escalate", "digest", "ignore"]);
+const urgencySchema = z.enum(["low", "normal", "high"]);
+const statusSchema = z.enum(["unhandled", "escalated", "digested", "ignored"]);
+
+const ruleSchema = z.object({
+  id: z.string(),
+  matchType: matchTypeSchema,
+  matchValue: z.string(),
+  action: actionSchema,
+  urgency: urgencySchema,
+  createdAt: z.string(),
+}).strict();
+
+const messageSummarySchema = z.object({
+  id: z.string(),
+  account: z.string(),
+  from: z.string(),
+  subject: z.string(),
+  snippet: z.string(),
+  receivedAt: z.string(),
+  status: statusSchema,
+  urgency: urgencySchema,
+  ruleId: z.string().nullable(),
+  taskKey: z.string().nullable(),
+}).strict();
+
+// The frontend never sends a raw SQL LIKE pattern — `query` is a plain
+// substring the backend wraps itself, same as the mail_inbox agent tool.
+export const rpcContract = defineRpcContract({
+  listMessages: {
+    input: z.object({
+      account: z.string().optional(),
+      status: statusSchema.optional(),
+      query: z.string().optional(),
+      offset: z.number().int().min(0).optional().default(0),
+      limit: z.number().int().positive().max(200).optional().default(50),
+    }).strict(),
+    output: z.object({
+      messages: z.array(messageSummarySchema),
+      total: z.number().int(),
+    }).strict(),
+  },
+  getMessageBody: {
+    input: z.object({ id: z.string() }).strict(),
+    output: z.object({
+      id: z.string(),
+      account: z.string(),
+      from: z.string(),
+      to: z.string(),
+      subject: z.string(),
+      receivedAt: z.string(),
+      body: z.string(),
+      status: statusSchema,
+      urgency: urgencySchema,
+      appliedRule: ruleSchema.nullable(),
+    }).strict(),
+  },
+  listRules: {
+    input: z.null(),
+    output: z.object({ rules: z.array(ruleSchema) }).strict(),
+  },
+  createRule: {
+    input: z.object({
+      matchType: matchTypeSchema,
+      matchValue: z.string().trim().min(1),
+      action: actionSchema,
+      urgency: urgencySchema.optional().default("normal"),
+    }).strict(),
+    output: z.object({ rule: ruleSchema }).strict(),
+  },
+  updateRule: {
+    input: z.object({
+      id: z.string(),
+      matchType: matchTypeSchema,
+      matchValue: z.string().trim().min(1),
+      action: actionSchema,
+      urgency: urgencySchema,
+    }).strict(),
+    output: z.object({ rule: ruleSchema }).strict(),
+  },
+  deleteRule: {
+    input: z.object({ id: z.string() }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  previewRuleMatches: {
+    input: z.object({
+      matchType: matchTypeSchema,
+      matchValue: z.string(),
+    }).strict(),
+    output: z.object({ matchCount: z.number().int(), sampleSize: z.number().int() }).strict(),
+  },
+  listDrafts: {
+    input: z.null(),
+    output: z.object({
+      drafts: z.array(
+        z.object({
+          id: z.string(),
+          messageId: z.string(),
+          account: z.string(),
+          subject: z.string(),
+          bodyPreview: z.string(),
+          createdAt: z.string(),
+          threadId: z.string().nullable(),
+          originalMessage: z.object({ subject: z.string(), from: z.string(), account: z.string() }).nullable(),
+        }).strict(),
+      ),
+    }).strict(),
+  },
+  listAccounts: {
+    input: z.null(),
+    output: z.object({
+      accounts: z.array(
+        z.object({
+          address: z.string(),
+          secretName: z.string(),
+          configured: z.boolean(),
+          lastPolledAt: z.string().nullable(),
+          lastError: z.string().nullable(),
+        }).strict(),
+      ),
+    }).strict(),
+  },
+  draftReplyThread: {
+    input: z.object({ messageId: z.string(), projectId: z.string().nullable() }).strict(),
+    output: z.object({ threadId: z.string() }).strict(),
+  },
+});
 
 interface AccountConfig {
   address: string;
@@ -107,6 +236,17 @@ export default async function plugin(bb: BbPluginApi) {
       account TEXT PRIMARY KEY,
       last_uid INTEGER NOT NULL DEFAULT 0
     )`,
+    `ALTER TABLE account_cursors ADD COLUMN last_polled_at TEXT`,
+    `ALTER TABLE account_cursors ADD COLUMN last_error TEXT`,
+    `CREATE TABLE IF NOT EXISTS drafts (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL,
+      account TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      body TEXT NOT NULL,
+      thread_id TEXT,
+      created_at TEXT NOT NULL
+    )`,
   ]);
 
   function loadRules(): Rule[] {
@@ -162,6 +302,32 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  function rowToMessageSummary(row: any) {
+    return {
+      id: row.id,
+      account: row.account,
+      from: row.from_address,
+      subject: row.subject,
+      snippet: row.snippet,
+      receivedAt: row.received_at,
+      status: row.status,
+      urgency: row.urgency,
+      ruleId: row.rule_id,
+      taskKey: row.task_key,
+    };
+  }
+
+  function rowToRule(row: any): Rule {
+    return {
+      id: row.id,
+      matchType: row.match_type,
+      matchValue: row.match_value,
+      action: row.action,
+      urgency: row.urgency,
+      createdAt: row.created_at,
+    };
+  }
+
   async function pollOnce(): Promise<void> {
     const accounts = await resolveAccounts();
     if (accounts.length === 0) {
@@ -170,6 +336,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
     }
     const rules = loadRules();
+    let anyNewMessages = false;
     for (const account of accounts) {
       try {
         const cursorRow = db.prepare(`SELECT last_uid FROM account_cursors WHERE account = ?`).get(account.address) as
@@ -177,6 +344,7 @@ export default async function plugin(bb: BbPluginApi) {
           | undefined;
         const lastUid = cursorRow?.last_uid ?? 0;
         const fetched = await pollInbox(account, lastUid);
+        if (fetched.length > 0) anyNewMessages = true;
         let maxUid = lastUid;
         for (const message of fetched) {
           maxUid = Math.max(maxUid, message.uid);
@@ -227,13 +395,18 @@ export default async function plugin(bb: BbPluginApi) {
           );
         }
         db.prepare(
-          `INSERT INTO account_cursors (account, last_uid) VALUES (?, ?)
-           ON CONFLICT(account) DO UPDATE SET last_uid = excluded.last_uid`,
-        ).run(account.address, maxUid);
+          `INSERT INTO account_cursors (account, last_uid, last_polled_at, last_error) VALUES (?, ?, ?, NULL)
+           ON CONFLICT(account) DO UPDATE SET last_uid = excluded.last_uid, last_polled_at = excluded.last_polled_at, last_error = NULL`,
+        ).run(account.address, maxUid, new Date().toISOString());
       } catch (err) {
         bb.log.error(`poll failed for ${account.address}: ${err}`);
+        db.prepare(
+          `INSERT INTO account_cursors (account, last_uid, last_polled_at, last_error) VALUES (?, 0, ?, ?)
+           ON CONFLICT(account) DO UPDATE SET last_polled_at = excluded.last_polled_at, last_error = excluded.last_error`,
+        ).run(account.address, new Date().toISOString(), String(err));
       }
     }
+    if (anyNewMessages) bb.realtime.publish("messages-changed", { reason: "new-mail" });
   }
 
   const initial = await settings.get();
@@ -242,6 +415,177 @@ export default async function plugin(bb: BbPluginApi) {
       "Add at least one Gmail account to the `accounts` setting and its app password secret, then reload.",
     );
   }
+
+  bb.rpc.register(rpcContract, {
+    listMessages({ account, status, query, offset, limit }) {
+      const clauses: string[] = [];
+      const params: unknown[] = [];
+      if (account) {
+        clauses.push("account = ?");
+        params.push(account);
+      }
+      if (status) {
+        clauses.push("status = ?");
+        params.push(status);
+      }
+      if (query) {
+        clauses.push("(subject LIKE ? OR from_address LIKE ? OR snippet LIKE ?)");
+        const like = `%${query}%`;
+        params.push(like, like, like);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+      const total = (
+        db.prepare(`SELECT COUNT(*) AS count FROM messages ${where}`).get(...params) as { count: number }
+      ).count;
+      const rows = db
+        .prepare(`SELECT * FROM messages ${where} ORDER BY received_at DESC LIMIT ? OFFSET ?`)
+        .all(...params, limit, offset);
+      return { messages: rows.map(rowToMessageSummary), total };
+    },
+    async getMessageBody({ id }) {
+      const row = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(id) as any;
+      if (!row) throw new Error(`No such message: ${id}`);
+      const accounts = await resolveAccounts();
+      const account = accounts.find((a) => a.address === row.account);
+      if (!account) throw new Error(`Account not configured: ${row.account}`);
+      const body = await fetchMessageBody(account, row.uid);
+      const rules = loadRules();
+      const appliedRule = row.rule_id ? (rules.find((r) => r.id === row.rule_id) ?? null) : null;
+      return {
+        id: row.id,
+        account: row.account,
+        from: row.from_address,
+        to: body?.to ?? "",
+        subject: row.subject,
+        receivedAt: row.received_at,
+        body: body?.text ?? "",
+        status: row.status,
+        urgency: row.urgency,
+        appliedRule,
+      };
+    },
+    listRules() {
+      return { rules: loadRules() };
+    },
+    createRule({ matchType, matchValue, action, urgency }) {
+      const id = randomUUID();
+      const createdAt = new Date().toISOString();
+      db.prepare(
+        `INSERT INTO rules (id, match_type, match_value, action, urgency, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(id, matchType, matchValue, action, urgency, createdAt);
+      bb.realtime.publish("rules-changed", { reason: "created" });
+      return { rule: { id, matchType, matchValue, action, urgency, createdAt } };
+    },
+    updateRule({ id, matchType, matchValue, action, urgency }) {
+      const info = db
+        .prepare(`UPDATE rules SET match_type = ?, match_value = ?, action = ?, urgency = ? WHERE id = ?`)
+        .run(matchType, matchValue, action, urgency, id);
+      if (info.changes === 0) throw new Error(`No such rule: ${id}`);
+      const row = db.prepare(`SELECT * FROM rules WHERE id = ?`).get(id) as any;
+      bb.realtime.publish("rules-changed", { reason: "updated" });
+      return { rule: rowToRule(row) };
+    },
+    deleteRule({ id }) {
+      const info = db.prepare(`DELETE FROM rules WHERE id = ?`).run(id);
+      if (info.changes === 0) throw new Error(`No such rule: ${id}`);
+      bb.realtime.publish("rules-changed", { reason: "deleted" });
+      return { ok: true as const };
+    },
+    previewRuleMatches({ matchType, matchValue }) {
+      const rows = db
+        .prepare(`SELECT from_address, subject, list_id FROM messages ORDER BY received_at DESC LIMIT 200`)
+        .all() as Array<{ from_address: string; subject: string; list_id: string | null }>;
+      const candidate: Rule = { id: "preview", matchType, matchValue, action: "digest", urgency: "normal", createdAt: "" };
+      const matchCount = rows.filter((r) =>
+        matchesRule({ from: r.from_address, subject: r.subject, listId: r.list_id }, candidate),
+      ).length;
+      return { matchCount, sampleSize: rows.length };
+    },
+    listDrafts() {
+      const rows = db
+        .prepare(
+          `SELECT d.*, m.subject AS orig_subject, m.from_address AS orig_from, m.account AS orig_account
+           FROM drafts d LEFT JOIN messages m ON m.id = d.message_id
+           ORDER BY d.created_at DESC`,
+        )
+        .all() as any[];
+      return {
+        drafts: rows.map((row) => ({
+          id: row.id,
+          messageId: row.message_id,
+          account: row.account,
+          subject: row.subject,
+          bodyPreview: row.body.length > 200 ? `${row.body.slice(0, 200)}…` : row.body,
+          createdAt: row.created_at,
+          threadId: row.thread_id ?? null,
+          originalMessage:
+            row.orig_subject != null
+              ? { subject: row.orig_subject, from: row.orig_from, account: row.orig_account }
+              : null,
+        })),
+      };
+    },
+    async listAccounts() {
+      const values = await settings.get();
+      const configured = parseAccounts(values.accounts ?? "[]");
+      const bySlotKey: Record<string, string | undefined> = {
+        gmailAppPasswordPrimary: values.gmailAppPasswordPrimary,
+        gmailAppPasswordSecondary: values.gmailAppPasswordSecondary,
+        gmailAppPasswordTertiary: values.gmailAppPasswordTertiary,
+        gmailAppPasswordQuaternary: values.gmailAppPasswordQuaternary,
+        gmailAppPasswordQuinary: values.gmailAppPasswordQuinary,
+      };
+      const cursors = db.prepare(`SELECT account, last_polled_at, last_error FROM account_cursors`).all() as Array<{
+        account: string;
+        last_polled_at: string | null;
+        last_error: string | null;
+      }>;
+      const cursorByAccount = new Map(cursors.map((c) => [c.account, c]));
+      return {
+        accounts: configured.map((account) => ({
+          address: account.address,
+          secretName: account.secretName,
+          configured: Boolean(bySlotKey[account.secretName]),
+          lastPolledAt: cursorByAccount.get(account.address)?.last_polled_at ?? null,
+          lastError: cursorByAccount.get(account.address)?.last_error ?? null,
+        })),
+      };
+    },
+    async draftReplyThread({ messageId, projectId }) {
+      const row = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(messageId) as any;
+      if (!row) throw new Error(`No such message: ${messageId}`);
+
+      let resolvedProjectId = projectId;
+      if (!resolvedProjectId) {
+        const projects = await bb.sdk.projects.list({ includePersonal: true });
+        const personal = projects.find((p) => p.kind === "personal") ?? projects[0];
+        if (!personal) throw new Error("No project available to host the reply thread.");
+        resolvedProjectId = personal.id;
+      }
+
+      const prompt = [
+        "Compose a reply to this email and save it as a Gmail draft. Never send it — bb never sends mail.",
+        "",
+        `Account: ${row.account}`,
+        `From: ${row.from_address}`,
+        `Subject: ${row.subject}`,
+        `Snippet: ${row.snippet}`,
+        "",
+        "Read the full message with the mail_inbox tool or `bb mail digest` if you need more context, draft a" +
+          " reply body, and save it (never send it) by running:",
+        `  bb mail draft ${row.id} --body "<your reply text>"`,
+        "That appends the draft into the account's own Gmail Drafts folder for a human to review and send.",
+      ].join("\n");
+
+      const thread = await bb.sdk.threads.spawn({
+        projectId: resolvedProjectId,
+        environment: { type: "project-default" },
+        prompt,
+        title: `Draft reply: ${row.subject || "(no subject)"}`,
+      });
+      return { threadId: thread.id };
+    },
+  });
 
   bb.background.service("poller", {
     async start(signal) {
@@ -286,7 +630,7 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb mail draft <message-id> --body <text> | --body-file <path>",
       },
     ],
-    async run(argv) {
+    async run(argv, ctx) {
       const [sub, sub2, ...rest] = argv;
 
       if (sub === "rule" && sub2 === "add") {
@@ -308,6 +652,7 @@ export default async function plugin(bb: BbPluginApi) {
         db.prepare(
           `INSERT INTO rules (id, match_type, match_value, action, urgency, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
         ).run(id, matchType, matchValue, action, urgency, new Date().toISOString());
+        bb.realtime.publish("rules-changed", { reason: "created" });
         return { exitCode: 0, stdout: `Rule ${id} added.\n` };
       }
 
@@ -324,6 +669,7 @@ export default async function plugin(bb: BbPluginApi) {
         const ruleId = rest[0];
         if (!ruleId) return { exitCode: 1, stderr: "Usage: bb mail rule rm <rule-id>\n" };
         const info = db.prepare(`DELETE FROM rules WHERE id = ?`).run(ruleId);
+        if (info.changes > 0) bb.realtime.publish("rules-changed", { reason: "deleted" });
         return info.changes > 0
           ? { exitCode: 0, stdout: `Rule ${ruleId} removed.\n` }
           : { exitCode: 1, stderr: `No such rule: ${ruleId}\n` };
@@ -365,6 +711,10 @@ export default async function plugin(bb: BbPluginApi) {
           date: new Date().toUTCString(),
         });
         await appendDraft(account, raw);
+        db.prepare(
+          `INSERT INTO drafts (id, message_id, account, subject, body, thread_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(randomUUID(), row.id, account.address, replySubject(row.subject), body, ctx?.threadId ?? null, new Date().toISOString());
+        bb.realtime.publish("drafts-changed", { reason: "created" });
         return { exitCode: 0, stdout: `Draft saved to ${account.address}'s [Gmail]/Drafts.\n` };
       }
 

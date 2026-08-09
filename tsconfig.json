@@ -18,6 +18,9 @@
       ],
       "@bb/plugin-sdk/app": [
         "./types/bb-plugin-sdk-app.d.ts"
+      ],
+      "@/*": [
+        "./*"
       ]
     },
     "noEmit": true,
@@ -25,8 +28,12 @@
   },
   "include": [
     "server.ts",
+    "app.tsx",
     "lib",
+    "components",
+    "hooks",
     "*.test.ts",
+    "*.test.tsx",
     "types"
   ]
 }

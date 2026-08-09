@@ -93,4 +93,72 @@ describe("bb-plugin-mail server", () => {
     expect(parsed).toEqual([]);
     await harness.lifecycle.dispose();
   });
+
+  it("exposes panel data and rule mutations through RPC", async () => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "mail",
+      settings: {
+        accounts: JSON.stringify([{ address: "jose@gmail.com", secretName: "gmailAppPasswordPrimary" }]),
+        gmailAppPasswordPrimary: "app-password-value",
+      },
+    });
+    await plugin(bb);
+    const db = bb.storage.database();
+    db.prepare(
+      `INSERT INTO messages
+        (id, account, uid, message_id, from_address, subject, snippet, list_id, received_at, status, urgency, rule_id, task_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "jose@gmail.com:1",
+      "jose@gmail.com",
+      1,
+      "<message-1@example.com>",
+      "alerts@example.com",
+      "Review this",
+      "A short preview",
+      null,
+      "2026-08-09T12:00:00.000Z",
+      "unhandled",
+      "normal",
+      null,
+      null,
+      "2026-08-09T12:00:01.000Z",
+    );
+
+    const added = await harness.behavior.callRpc("createRule", {
+      matchType: "domain",
+      matchValue: "example.com",
+      action: "escalate",
+      urgency: "high",
+    }) as { rule: { id: string; matchValue: string } };
+    expect(added.rule.matchValue).toBe("example.com");
+
+    const accounts = await harness.behavior.callRpc("listAccounts") as {
+      accounts: Array<{ address: string; configured: boolean }>;
+    };
+    expect(accounts.accounts).toEqual([{ address: "jose@gmail.com", configured: true, lastError: null, lastPolledAt: null, secretName: "gmailAppPasswordPrimary" }]);
+
+    const messages = await harness.behavior.callRpc("listMessages", { limit: 100, offset: 0 }) as {
+      messages: Array<{ id: string; from: string; status: string }>;
+    };
+    expect(messages.messages).toMatchObject([
+      {
+        id: "jose@gmail.com:1",
+        from: "alerts@example.com",
+        status: "unhandled",
+      },
+    ]);
+    const rules = await harness.behavior.callRpc("listRules") as { rules: unknown[] };
+    expect(rules.rules).toHaveLength(1);
+    expect(harness.inspection.realtimeSignals.at(-1)).toMatchObject({
+      channel: "rules-changed",
+    });
+
+    const removed = await harness.behavior.callRpc("deleteRule", { id: added.rule.id });
+    expect(removed).toEqual({ ok: true });
+    const afterRemove = await harness.behavior.callRpc("listRules") as { rules: unknown[] };
+    expect(afterRemove.rules).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
 });

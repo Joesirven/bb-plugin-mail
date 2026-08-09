@@ -1,0 +1,913 @@
+import * as React from "react";
+import { toast } from "sonner";
+import {
+  definePluginApp,
+  useBbNavigate,
+  useRealtime,
+  useRpc,
+  type PluginNavPanelProps,
+} from "@bb/plugin-sdk/app";
+
+import type { rpcContract } from "./server";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+
+// ---------------------------------------------------------------------------
+// Shared types (structural mirrors of the rpc contract's inferred shapes —
+// kept local so this file only ever imports server.ts as a type).
+// ---------------------------------------------------------------------------
+
+type MatchType = "from" | "domain" | "subject-contains" | "list-id";
+type RuleAction = "escalate" | "digest" | "ignore";
+type RuleUrgency = "low" | "normal" | "high";
+type MessageStatus = "unhandled" | "escalated" | "digested" | "ignored";
+
+interface Rule {
+  id: string;
+  matchType: MatchType;
+  matchValue: string;
+  action: RuleAction;
+  urgency: RuleUrgency;
+  createdAt: string;
+}
+
+interface MessageSummary {
+  id: string;
+  account: string;
+  from: string;
+  subject: string;
+  snippet: string;
+  receivedAt: string;
+  status: MessageStatus;
+  urgency: RuleUrgency;
+  ruleId: string | null;
+  taskKey: string | null;
+}
+
+interface AccountHealth {
+  address: string;
+  secretName: string;
+  configured: boolean;
+  lastPolledAt: string | null;
+  lastError: string | null;
+}
+
+interface DraftSummary {
+  id: string;
+  messageId: string;
+  account: string;
+  subject: string;
+  bodyPreview: string;
+  createdAt: string;
+  threadId: string | null;
+  originalMessage: { subject: string; from: string; account: string } | null;
+}
+
+const MESSAGE_PAGE_SIZE = 50;
+
+const matchTypeOptions: Array<{ value: MatchType; label: string }> = [
+  { value: "from", label: "From" },
+  { value: "domain", label: "Domain" },
+  { value: "subject-contains", label: "Subject contains" },
+  { value: "list-id", label: "List id" },
+];
+
+const actionOptions: Array<{ value: RuleAction; label: string }> = [
+  { value: "escalate", label: "Escalate" },
+  { value: "digest", label: "Digest" },
+  { value: "ignore", label: "Ignore" },
+];
+
+const urgencyOptions: Array<{ value: RuleUrgency; label: string }> = [
+  { value: "low", label: "Low" },
+  { value: "normal", label: "Normal" },
+  { value: "high", label: "High" },
+];
+
+const statusFilterOptions: Array<{ value: MessageStatus | "all"; label: string }> = [
+  { value: "all", label: "All states" },
+  { value: "escalated", label: "Escalated" },
+  { value: "digested", label: "Digest" },
+  { value: "unhandled", label: "Unhandled" },
+  { value: "ignored", label: "Ignored" },
+];
+
+function formatTime(value: string | null) {
+  if (!value) return "never";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function statusTone(status: MessageStatus): "default" | "secondary" | "outline" | "destructive" {
+  if (status === "escalated") return "default";
+  if (status === "ignored") return "secondary";
+  if (status === "unhandled") return "outline";
+  return "outline";
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function SelectField<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+  className,
+}: {
+  label: string;
+  value: T;
+  options: Array<{ value: T; label: string }>;
+  onChange(value: T): void;
+  className?: string;
+}) {
+  return (
+    <label className={className ?? "grid gap-1.5"}>
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      <select
+        className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        value={value}
+        onChange={(event) => onChange(event.currentTarget.value as T)}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sub-routing — the panel owns /plugins/mail/mail/*, so sub-navigation lives
+// in the route's subPath: "" (inbox), "triage", "drafts", "accounts",
+// "inbox/<message-id>" for the detail view. Deep-linkable, and browser
+// back/forward walks panel-internal history.
+// ---------------------------------------------------------------------------
+
+const PANEL_PATH = "mail";
+
+type Route =
+  | { view: "inbox" }
+  | { view: "message"; id: string }
+  | { view: "triage" }
+  | { view: "drafts" }
+  | { view: "accounts" };
+
+function parseSubPath(subPath: string): Route {
+  const parts = subPath.split("/").filter((p) => p.length > 0);
+  if (parts[0] === "inbox" && parts.length >= 2) {
+    return { view: "message", id: decodeURIComponent(parts.slice(1).join("/")) };
+  }
+  if (parts[0] === "triage") return { view: "triage" };
+  if (parts[0] === "drafts") return { view: "drafts" };
+  if (parts[0] === "accounts") return { view: "accounts" };
+  return { view: "inbox" };
+}
+
+function routeToSubPath(route: Route): string {
+  switch (route.view) {
+    case "inbox":
+      return "";
+    case "message":
+      return `inbox/${encodeURIComponent(route.id)}`;
+    case "triage":
+      return "triage";
+    case "drafts":
+      return "drafts";
+    case "accounts":
+      return "accounts";
+  }
+}
+
+function useSubPathRoute(subPath: string): [Route, (route: Route) => void] {
+  const bbNavigate = useBbNavigate();
+  const route = React.useMemo(() => parseSubPath(subPath), [subPath]);
+  const navigate = React.useCallback(
+    (next: Route) => {
+      bbNavigate.toPluginPanel(PANEL_PATH, { subPath: routeToSubPath(next) });
+    },
+    [bbNavigate],
+  );
+  return [route, navigate];
+}
+
+// ---------------------------------------------------------------------------
+// Data hooks.
+// ---------------------------------------------------------------------------
+
+function useAccounts(): { accounts: AccountHealth[] | null; error: string | null; refetch(): void } {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = React.useState<{ accounts: AccountHealth[] | null; error: string | null }>({
+    accounts: null,
+    error: null,
+  });
+  const refetch = React.useCallback(() => {
+    rpc.call("listAccounts").then(
+      (result) => setState({ accounts: result.accounts, error: null }),
+      (error: unknown) => setState({ accounts: null, error: errorText(error) }),
+    );
+  }, [rpc]);
+  React.useEffect(() => refetch(), [refetch]);
+  useRealtime("messages-changed", refetch);
+  return { ...state, refetch };
+}
+
+function useRules(): { rules: Rule[] | null; error: string | null; refetch(): void } {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = React.useState<{ rules: Rule[] | null; error: string | null }>({
+    rules: null,
+    error: null,
+  });
+  const refetch = React.useCallback(() => {
+    rpc.call("listRules").then(
+      (result) => setState({ rules: result.rules, error: null }),
+      (error: unknown) => setState({ rules: null, error: errorText(error) }),
+    );
+  }, [rpc]);
+  React.useEffect(() => refetch(), [refetch]);
+  useRealtime("rules-changed", refetch);
+  return { ...state, refetch };
+}
+
+function useDrafts(): { drafts: DraftSummary[] | null; error: string | null; refetch(): void } {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = React.useState<{ drafts: DraftSummary[] | null; error: string | null }>({
+    drafts: null,
+    error: null,
+  });
+  const refetch = React.useCallback(() => {
+    rpc.call("listDrafts").then(
+      (result) => setState({ drafts: result.drafts, error: null }),
+      (error: unknown) => setState({ drafts: null, error: errorText(error) }),
+    );
+  }, [rpc]);
+  React.useEffect(() => refetch(), [refetch]);
+  useRealtime("drafts-changed", refetch);
+  return { ...state, refetch };
+}
+
+// ---------------------------------------------------------------------------
+// Inbox tab.
+// ---------------------------------------------------------------------------
+
+function InboxTab({
+  accounts,
+  onOpenMessage,
+}: {
+  accounts: AccountHealth[];
+  onOpenMessage(id: string): void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [account, setAccount] = React.useState("all");
+  const [status, setStatus] = React.useState<MessageStatus | "all">("all");
+  const [query, setQuery] = React.useState("");
+  const [offset, setOffset] = React.useState(0);
+  const [messages, setMessages] = React.useState<MessageSummary[]>([]);
+  const [total, setTotal] = React.useState(0);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(
+    (nextOffset: number) => {
+      const trimmedQuery = query.trim();
+      rpc
+        .call("listMessages", {
+          ...(account === "all" ? {} : { account }),
+          ...(status === "all" ? {} : { status }),
+          ...(trimmedQuery ? { query: trimmedQuery } : {}),
+          offset: nextOffset,
+          limit: MESSAGE_PAGE_SIZE,
+        })
+        .then((result) => {
+          setMessages((prev) => (nextOffset === 0 ? result.messages : [...prev, ...result.messages]));
+          setTotal(result.total);
+          setError(null);
+        })
+        .catch((err: unknown) => setError(errorText(err)));
+    },
+    [rpc, account, status, query],
+  );
+
+  React.useEffect(() => {
+    setOffset(0);
+    refresh(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account, status, query]);
+
+  useRealtime("messages-changed", () => refresh(0));
+
+  const accountOptions = [
+    { value: "all", label: "All accounts" },
+    ...accounts.map((a) => ({ value: a.address, label: a.address })),
+  ];
+
+  return (
+    <div className="grid gap-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <label className="grid gap-1.5">
+          <span className="text-xs font-medium text-muted-foreground">Search</span>
+          <Input
+            value={query}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            placeholder="Subject, sender, or snippet"
+            className="w-64"
+          />
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <SelectField label="Account" value={account} options={accountOptions} onChange={setAccount} />
+          <SelectField<MessageStatus | "all"> label="Triage state" value={status} options={statusFilterOptions} onChange={setStatus} />
+        </div>
+      </div>
+
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
+      {messages.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
+          No messages match the current filters.
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-md border border-border">
+          <table className="w-full table-fixed border-collapse text-sm">
+            <thead className="bg-muted/40 text-left text-xs font-medium uppercase text-muted-foreground">
+              <tr>
+                <th className="w-[16%] px-3 py-2">Sender</th>
+                <th className="w-[12%] px-3 py-2">Account</th>
+                <th className="w-[28%] px-3 py-2">Subject</th>
+                <th className="w-[20%] px-3 py-2">Snippet</th>
+                <th className="w-[12%] px-3 py-2">Received</th>
+                <th className="w-[12%] px-3 py-2">Triage</th>
+              </tr>
+            </thead>
+            <tbody>
+              {messages.map((message) => (
+                <tr
+                  key={message.id}
+                  className="cursor-pointer border-t border-border align-top hover:bg-muted/30"
+                  onClick={() => onOpenMessage(message.id)}
+                >
+                  <td className="truncate px-3 py-3 font-medium text-foreground">{message.from}</td>
+                  <td className="truncate px-3 py-3 text-muted-foreground">{message.account}</td>
+                  <td className="px-3 py-3">
+                    <div className="truncate text-foreground">{message.subject || "(no subject)"}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">{message.urgency} urgency</div>
+                  </td>
+                  <td className="px-3 py-3 text-muted-foreground">
+                    <div className="line-clamp-2">{message.snippet}</div>
+                  </td>
+                  <td className="px-3 py-3 text-muted-foreground">{formatTime(message.receivedAt)}</td>
+                  <td className="px-3 py-3">
+                    <Badge variant={statusTone(message.status)}>{message.status}</Badge>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {messages.length < total ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="justify-self-start"
+          onClick={() => {
+            const next = offset + MESSAGE_PAGE_SIZE;
+            setOffset(next);
+            refresh(next);
+          }}
+        >
+          Load more ({messages.length} of {total})
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Message detail view.
+// ---------------------------------------------------------------------------
+
+interface MessageDetail {
+  id: string;
+  account: string;
+  from: string;
+  to: string;
+  subject: string;
+  receivedAt: string;
+  body: string;
+  status: MessageStatus;
+  urgency: RuleUrgency;
+  appliedRule: Rule | null;
+}
+
+function MessageDetailView({ id, onBack }: { id: string; onBack(): void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const bbNavigate = useBbNavigate();
+  const [detail, setDetail] = React.useState<MessageDetail | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [isDrafting, setIsDrafting] = React.useState(false);
+
+  React.useEffect(() => {
+    setDetail(null);
+    setError(null);
+    rpc.call("getMessageBody", { id }).then(
+      (result) => setDetail(result),
+      (err: unknown) => setError(errorText(err)),
+    );
+  }, [rpc, id]);
+
+  async function draftReply() {
+    setIsDrafting(true);
+    try {
+      const result = await rpc.call("draftReplyThread", { messageId: id, projectId: null });
+      toast.success("Reply thread started");
+      bbNavigate.toThread(result.threadId);
+    } catch (err) {
+      toast.error(errorText(err));
+    } finally {
+      setIsDrafting(false);
+    }
+  }
+
+  return (
+    <div className="grid gap-3">
+      <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={onBack}>
+        <Icon name="ChevronLeft" className="size-4" />
+        Back to inbox
+      </Button>
+
+      {error ? <div className="rounded-md border border-destructive/40 p-4 text-sm text-destructive">{error}</div> : null}
+
+      {!detail && !error ? <p className="text-sm text-muted-foreground">Loading message…</p> : null}
+
+      {detail ? (
+        <div className="grid gap-4 rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0">
+              <h2 className="text-base font-semibold text-foreground">{detail.subject || "(no subject)"}</h2>
+              <dl className="mt-2 grid gap-1 text-sm text-muted-foreground">
+                <div><span className="font-medium text-foreground">From:</span> {detail.from}</div>
+                {detail.to ? <div><span className="font-medium text-foreground">To:</span> {detail.to}</div> : null}
+                <div><span className="font-medium text-foreground">Account:</span> {detail.account}</div>
+                <div><span className="font-medium text-foreground">Received:</span> {formatTime(detail.receivedAt)}</div>
+              </dl>
+            </div>
+            <div className="flex flex-col items-end gap-2">
+              <Badge variant={statusTone(detail.status)}>{detail.status}</Badge>
+              <Button type="button" size="sm" onClick={() => void draftReply()} disabled={isDrafting}>
+                <Icon name="Zap" className="size-4" />
+                {isDrafting ? "Starting…" : "Draft a reply"}
+              </Button>
+            </div>
+          </div>
+
+          {detail.appliedRule ? (
+            <div className="rounded-md bg-muted/40 p-3 text-sm">
+              <span className="font-medium text-foreground">Applied rule:</span>{" "}
+              {detail.appliedRule.matchType} = {detail.appliedRule.matchValue} → {detail.appliedRule.action} ({detail.appliedRule.urgency})
+            </div>
+          ) : (
+            <div className="rounded-md bg-muted/40 p-3 text-sm text-muted-foreground">No rule matched — default digest handling.</div>
+          )}
+
+          <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-background p-3 text-sm text-foreground">
+            {detail.body || "(empty body)"}
+          </pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Triage tab — rule CRUD with a live match-count preview.
+// ---------------------------------------------------------------------------
+
+function useMatchPreview(matchType: MatchType, matchValue: string): { matchCount: number; sampleSize: number } | null {
+  const rpc = useRpc<typeof rpcContract>();
+  const [preview, setPreview] = React.useState<{ matchCount: number; sampleSize: number } | null>(null);
+
+  React.useEffect(() => {
+    const trimmed = matchValue.trim();
+    if (!trimmed) {
+      setPreview(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      rpc.call("previewRuleMatches", { matchType, matchValue: trimmed }).then(
+        (result) => {
+          if (!cancelled) setPreview(result);
+        },
+        () => {
+          if (!cancelled) setPreview(null);
+        },
+      );
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [rpc, matchType, matchValue]);
+
+  return preview;
+}
+
+function RuleForm({
+  initial,
+  onSaved,
+  onCancel,
+}: {
+  initial: Rule | null;
+  onSaved(): void;
+  onCancel?: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [matchType, setMatchType] = React.useState<MatchType>(initial?.matchType ?? "domain");
+  const [matchValue, setMatchValue] = React.useState(initial?.matchValue ?? "");
+  const [action, setAction] = React.useState<RuleAction>(initial?.action ?? "digest");
+  const [urgency, setUrgency] = React.useState<RuleUrgency>(initial?.urgency ?? "normal");
+  const [error, setError] = React.useState<string | null>(null);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const preview = useMatchPreview(matchType, matchValue);
+
+  async function save(event: React.FormEvent) {
+    event.preventDefault();
+    const trimmed = matchValue.trim();
+    if (!trimmed) return;
+    setIsSaving(true);
+    setError(null);
+    try {
+      if (initial) {
+        await rpc.call("updateRule", { id: initial.id, matchType, matchValue: trimmed, action, urgency });
+      } else {
+        await rpc.call("createRule", { matchType, matchValue: trimmed, action, urgency });
+        setMatchValue("");
+      }
+      onSaved();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  return (
+    <form className="grid gap-2 rounded-md border border-border p-3" onSubmit={save}>
+      <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1fr)]">
+        <SelectField<MatchType> label="Match" value={matchType} options={matchTypeOptions} onChange={setMatchType} />
+        <label className="grid gap-1.5">
+          <span className="text-xs font-medium text-muted-foreground">Value</span>
+          <Input value={matchValue} onChange={(event) => setMatchValue(event.currentTarget.value)} placeholder="example.com" />
+        </label>
+        <SelectField<RuleAction> label="Action" value={action} options={actionOptions} onChange={setAction} />
+        <SelectField<RuleUrgency> label="Urgency" value={urgency} options={urgencyOptions} onChange={setUrgency} />
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-muted-foreground">
+          {preview
+            ? `This rule would have matched ${preview.matchCount} of your last ${preview.sampleSize} messages.`
+            : "Enter a value to preview how many recent messages this rule would match."}
+        </p>
+        <div className="flex gap-2">
+          {onCancel ? (
+            <Button type="button" variant="ghost" size="sm" onClick={onCancel}>
+              Cancel
+            </Button>
+          ) : null}
+          <Button type="submit" size="sm" disabled={!matchValue.trim() || isSaving}>
+            {initial ? "Save changes" : "Add rule"}
+          </Button>
+        </div>
+      </div>
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+    </form>
+  );
+}
+
+function TriageTab({ rules, onChanged }: { rules: Rule[]; onChanged(): void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [editingId, setEditingId] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function removeRule(id: string) {
+    setError(null);
+    try {
+      await rpc.call("deleteRule", { id });
+      onChanged();
+    } catch (err) {
+      setError(errorText(err));
+    }
+  }
+
+  const editingRule = editingId ? (rules.find((r) => r.id === editingId) ?? null) : null;
+
+  return (
+    <div className="grid gap-4">
+      <div>
+        <h2 className="text-sm font-semibold text-foreground">Rules</h2>
+        <p className="text-sm text-muted-foreground">
+          Rules run in creation order; the first match wins. Unmatched mail is queued for digest.
+        </p>
+      </div>
+
+      {editingRule ? (
+        <RuleForm
+          key={editingRule.id}
+          initial={editingRule}
+          onSaved={() => {
+            setEditingId(null);
+            onChanged();
+          }}
+          onCancel={() => setEditingId(null)}
+        />
+      ) : (
+        <RuleForm initial={null} onSaved={onChanged} />
+      )}
+
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
+      <div className="rounded-md border border-border">
+        {rules.length === 0 ? (
+          <div className="p-3 text-sm text-muted-foreground">No rules configured.</div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {rules.map((rule) => (
+              <li key={rule.id} className="grid gap-2 p-3 md:grid-cols-[1fr_auto] md:items-center">
+                <div className="min-w-0">
+                  <div className="truncate text-sm text-foreground">
+                    <span className="font-medium">{rule.matchType}</span> = {rule.matchValue}
+                  </div>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
+                    <Badge variant="outline">{rule.action}</Badge>
+                    <Badge variant="secondary">{rule.urgency}</Badge>
+                  </div>
+                </div>
+                <div className="flex gap-1 justify-self-end">
+                  <Button type="button" variant="ghost" size="icon" aria-label={`Edit rule ${rule.matchValue}`} onClick={() => setEditingId(rule.id)}>
+                    <Icon name="Edit" className="size-4" />
+                  </Button>
+                  <Button type="button" variant="ghost" size="icon" aria-label={`Remove rule ${rule.matchValue}`} onClick={() => void removeRule(rule.id)}>
+                    <Icon name="Trash2" className="size-4" />
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Drafts tab.
+// ---------------------------------------------------------------------------
+
+function DraftsTab({ drafts }: { drafts: DraftSummary[] }) {
+  const bbNavigate = useBbNavigate();
+  return (
+    <div className="grid gap-4">
+      <div className="flex items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+        <Icon name="AlertCircle" className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+        <p className="text-foreground">
+          <span className="font-semibold">bb never sends.</span> Every draft here was saved to the account's own
+          Gmail Drafts folder over IMAP. Review and send it from Gmail — this plugin has no send/submit code path.
+        </p>
+      </div>
+
+      {drafts.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
+          No drafts yet. Open a message in the inbox and use "Draft a reply" to start one.
+        </div>
+      ) : (
+        <ul className="grid gap-2">
+          {drafts.map((draft) => (
+            <li key={draft.id} className="rounded-md border border-border p-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium text-foreground">{draft.subject}</div>
+                  <div className="mt-0.5 text-xs text-muted-foreground">
+                    {draft.account} · {formatTime(draft.createdAt)}
+                  </div>
+                </div>
+                {draft.threadId ? (
+                  <Button type="button" variant="outline" size="sm" onClick={() => bbNavigate.toThread(draft.threadId!)}>
+                    <Icon name="Zap" className="size-4" />
+                    Open thread
+                  </Button>
+                ) : null}
+              </div>
+              {draft.originalMessage ? (
+                <div className="mt-2 rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
+                  Replying to <span className="text-foreground">{draft.originalMessage.from}</span>:{" "}
+                  {draft.originalMessage.subject || "(no subject)"}
+                </div>
+              ) : null}
+              <p className="mt-2 line-clamp-3 text-sm text-muted-foreground">{draft.bodyPreview}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Accounts tab.
+// ---------------------------------------------------------------------------
+
+function AccountsTab({ accounts }: { accounts: AccountHealth[] }) {
+  return (
+    <div className="grid gap-4">
+      <div>
+        <h2 className="text-sm font-semibold text-foreground">Configured accounts</h2>
+        <p className="text-sm text-muted-foreground">Connection health for each Gmail account this plugin polls.</p>
+      </div>
+
+      {accounts.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
+          No accounts configured yet.
+        </div>
+      ) : (
+        <ul className="grid gap-2">
+          {accounts.map((account) => (
+            <li key={account.address} className="flex items-start justify-between gap-3 rounded-md border border-border p-3">
+              <div className="flex items-start gap-3">
+                <Icon
+                  name="ElectricPlugs"
+                  className={`mt-0.5 size-4 shrink-0 ${account.configured ? "text-foreground" : "text-muted-foreground"}`}
+                />
+                <div>
+                  <div className="text-sm font-medium text-foreground">{account.address}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">Secret: {account.secretName}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">Last successful poll: {formatTime(account.lastPolledAt)}</div>
+                  {account.lastError ? (
+                    <div className="mt-1 flex items-start gap-1 text-xs text-destructive">
+                      <Icon name="AlertTriangle" className="mt-0.5 size-3.5 shrink-0" />
+                      <span className="line-clamp-2">{account.lastError}</span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <Badge variant={account.configured ? "outline" : "secondary"}>
+                {account.configured ? "configured" : "missing secret"}
+              </Badge>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="rounded-md border border-border p-3">
+        <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+          <Icon name="UserRoundPlus" className="size-4" />
+          Add another account
+        </div>
+        <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-muted-foreground">
+          <li>Generate a Gmail app password for the account (Google Account → Security → 2-Step Verification → App passwords).</li>
+          <li>
+            Request it as a bb secret (a <code>bb secret request</code>, never typed into chat), then extend the
+            <code> accounts</code> plugin setting with the new <code>{"{ address, secretName }"}</code> entry using
+            the next free slot (<code>gmailAppPasswordSecondary</code>, <code>…Tertiary</code>, <code>…Quaternary</code>, <code>…Quinary</code>).
+          </li>
+          <li>
+            Run <code>bb plugin reload mail</code>. Secret values are never rendered here — only whether one is set.
+          </li>
+        </ol>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Panel shell.
+// ---------------------------------------------------------------------------
+
+function MailPanelHeader() {
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      onClick={() => window.dispatchEvent(new CustomEvent("mail-panel-refresh"))}
+      aria-label="Refresh Mail panel"
+    >
+      <Icon name="ArrowReloadHorizontal" className="size-4" />
+    </Button>
+  );
+}
+
+function NeedsConfiguration() {
+  return (
+    <div className="mx-auto flex min-h-full w-full max-w-2xl flex-col justify-center p-6 text-center">
+      <div className="rounded-md border border-border bg-card p-5">
+        <div className="mx-auto mb-3 flex size-10 items-center justify-center rounded-md bg-muted">
+          <Icon name="Settings" className="size-5 text-muted-foreground" />
+        </div>
+        <p className="text-base font-medium text-foreground">Mail needs an account before it can triage anything.</p>
+        <p className="mt-2 text-sm text-muted-foreground">
+          Add the <code>accounts</code> setting and its matching Gmail app password secret, then reload the plugin.
+          Setup steps are in <code>README.md</code> under "Configure an account", and summarized on the Accounts tab.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function MailPanel({ subPath }: PluginNavPanelProps) {
+  const [route, navigate] = useSubPathRoute(subPath);
+  const { accounts, error: accountsError, refetch: refetchAccounts } = useAccounts();
+  const { rules, error: rulesError, refetch: refetchRules } = useRules();
+  const { drafts, error: draftsError, refetch: refetchDrafts } = useDrafts();
+
+  React.useEffect(() => {
+    const listener = () => {
+      refetchAccounts();
+      refetchRules();
+      refetchDrafts();
+    };
+    window.addEventListener("mail-panel-refresh", listener);
+    return () => window.removeEventListener("mail-panel-refresh", listener);
+  }, [refetchAccounts, refetchRules, refetchDrafts]);
+
+  const error = accountsError ?? rulesError ?? draftsError;
+  if (error) {
+    return (
+      <div className="p-4 md:p-5">
+        <div className="rounded-md border border-destructive/40 p-4 text-sm text-destructive">{error}</div>
+      </div>
+    );
+  }
+
+  if (accounts === null || rules === null || drafts === null) {
+    return (
+      <div className="flex min-h-full items-center justify-center p-6 text-sm text-muted-foreground" role="status">
+        Loading mail…
+      </div>
+    );
+  }
+
+  const configuredAccounts = accounts.filter((a) => a.configured);
+  if (configuredAccounts.length === 0 && route.view !== "accounts") {
+    return <NeedsConfiguration />;
+  }
+
+  const activeTab = route.view === "message" ? "inbox" : route.view;
+
+  return (
+    <div className="min-h-full overflow-auto p-4 md:p-5">
+      <div className="mx-auto grid w-full max-w-6xl gap-4">
+        {route.view !== "message" ? (
+          <Tabs
+            value={activeTab}
+            onValueChange={(value) => {
+              if (value === "inbox" || value === "triage" || value === "drafts" || value === "accounts") {
+                navigate({ view: value });
+              }
+            }}
+          >
+            <TabsList>
+              <TabsTrigger value="inbox">Inbox</TabsTrigger>
+              <TabsTrigger value="triage">Triage</TabsTrigger>
+              <TabsTrigger value="drafts">Drafts</TabsTrigger>
+              <TabsTrigger value="accounts">Accounts</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        ) : null}
+
+        {route.view === "inbox" ? (
+          <InboxTab accounts={configuredAccounts} onOpenMessage={(id) => navigate({ view: "message", id })} />
+        ) : null}
+        {route.view === "message" ? (
+          <MessageDetailView id={route.id} onBack={() => navigate({ view: "inbox" })} />
+        ) : null}
+        {route.view === "triage" ? <TriageTab rules={rules} onChanged={refetchRules} /> : null}
+        {route.view === "drafts" ? <DraftsTab drafts={drafts} /> : null}
+        {route.view === "accounts" ? <AccountsTab accounts={accounts} /> : null}
+      </div>
+    </div>
+  );
+}
+
+export default definePluginApp((app) => {
+  app.slots.navPanel({
+    id: "mail",
+    title: "Mail",
+    icon: "Mail",
+    path: "mail",
+    component: MailPanel,
+    headerContent: MailPanelHeader,
+  });
+});

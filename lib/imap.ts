@@ -68,6 +68,45 @@ export async function pollInbox(account: ImapAccount, sinceUid: number): Promise
   }
 }
 
+export interface MessageBody {
+  from: string;
+  to: string;
+  subject: string;
+  receivedAt: string;
+  text: string;
+}
+
+// Fetches headers + text body for one message, on demand — never called
+// during the routine poll, only when a user opens a message's detail view.
+export async function fetchMessageBody(account: ImapAccount, uid: number): Promise<MessageBody | null> {
+  const c = client(account);
+  await c.connect();
+  try {
+    const lock = await c.getMailboxLock("INBOX");
+    try {
+      const msg = await c.fetchOne(String(uid), { envelope: true, uid: true, internalDate: true }, { uid: true });
+      if (!msg) return null;
+      const envelope = msg.envelope;
+      const download = await c.download(String(uid), "text", { uid: true });
+      const chunks: Buffer[] = [];
+      for await (const chunk of download.content) {
+        chunks.push(chunk as Buffer);
+      }
+      return {
+        from: envelope?.from?.[0]?.address ?? "unknown",
+        to: envelope?.to?.[0]?.address ?? "",
+        subject: envelope?.subject ?? "(no subject)",
+        receivedAt: new Date(msg.internalDate ?? Date.now()).toISOString(),
+        text: Buffer.concat(chunks).toString("utf8"),
+      };
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await c.logout();
+  }
+}
+
 // Appends a raw RFC 822 message to the account's Drafts folder — storage
 // only, never transmission.
 export async function appendDraft(account: ImapAccount, rawMessage: string): Promise<void> {

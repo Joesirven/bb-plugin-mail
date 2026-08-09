@@ -5,6 +5,8 @@
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import plugin from "./server";
 
 const ROOT = path.resolve(__dirname);
 const SKIP_DIRS = new Set(["node_modules", "dist", ".git", "types"]);
@@ -61,5 +63,17 @@ describe("no-send invariant", () => {
     const server = readFileSync(path.join(ROOT, "server.ts"), "utf8");
     expect(/name:\s*["']send["']/i.test(server)).toBe(false);
     expect(/name:\s*["']mail send["']/i.test(server)).toBe(false);
+  });
+
+  it("no rpc method exposed to the frontend is send-shaped", async () => {
+    const { bb, harness } = createFakePluginHost({ pluginId: "mail" });
+    await plugin(bb);
+    for (const method of harness.registrations.rpcMethods) {
+      expect(method, `rpc method "${method}" looks send-shaped`).not.toMatch(/send|submit|transmit/i);
+    }
+    // The rpc surface this test is meant to guard is non-trivial — this
+    // would also pass vacuously against an empty contract.
+    expect(harness.registrations.rpcMethods.length).toBeGreaterThan(5);
+    await harness.lifecycle.dispose();
   });
 });
