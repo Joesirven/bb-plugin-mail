@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
 
-import { appendDraft, fetchMessageBody, pollInbox } from "./lib/imap";
+import { appendDraft, describeImapError, fetchMessageBody, pollInbox } from "./lib/imap";
 import { buildDigest, formatDigestText, type DigestMessage } from "./lib/digest";
 import { buildRawEmail, replySubject } from "./lib/mime";
 import { matchesRule, triage, type Rule, type RuleAction, type RuleUrgency, type RuleMatchType } from "./lib/rules";
@@ -198,6 +198,18 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Poll interval (minutes)",
       default: "5",
     },
+    autoPollEnabled: {
+      // This was an interim safety valve for a period when the ImapFlow
+      // client had no "error" listener and a dropped socket crashed the
+      // whole bb server. lib/imap.ts now attaches that listener (and closes
+      // the client on abort via withClient), so an IMAP error is caught and
+      // logged instead of fatal. Defaulting to on means mail resumes polling
+      // by itself after every restart, with no manual step — the setting
+      // stays as an escape hatch if a future issue needs it turned off again.
+      type: "boolean",
+      label: "Automatically poll inboxes on a timer",
+      default: true,
+    },
     gmailAppPasswordPrimary: { type: "string", label: "Gmail app password (primary account)", secret: true },
     gmailAppPasswordSecondary: { type: "string", label: "Gmail app password (secondary account)", secret: true },
     gmailAppPasswordTertiary: { type: "string", label: "Gmail app password (tertiary account)", secret: true },
@@ -270,7 +282,9 @@ export default async function plugin(bb: BbPluginApi) {
     }));
   }
 
-  async function resolveAccounts(): Promise<Array<{ address: string; appPassword: string }>> {
+  async function resolveAccounts(
+    signal?: AbortSignal,
+  ): Promise<Array<{ address: string; appPassword: string; onError: (message: string) => void; signal: AbortSignal | undefined }>> {
     const values = await settings.get();
     const configured = parseAccounts(values.accounts ?? "[]");
     const bySlotKey: Record<string, string | undefined> = {
@@ -280,10 +294,17 @@ export default async function plugin(bb: BbPluginApi) {
       gmailAppPasswordQuaternary: values.gmailAppPasswordQuaternary,
       gmailAppPasswordQuinary: values.gmailAppPasswordQuinary,
     };
-    const resolved: Array<{ address: string; appPassword: string }> = [];
+    const resolved: Array<{ address: string; appPassword: string; onError: (message: string) => void; signal: AbortSignal | undefined }> = [];
     for (const account of configured) {
       const appPassword = bySlotKey[account.secretName];
-      if (appPassword) resolved.push({ address: account.address, appPassword });
+      if (appPassword) {
+        resolved.push({
+          address: account.address,
+          appPassword,
+          onError: (message) => bb.log.error(message),
+          signal,
+        });
+      }
     }
     return resolved;
   }
@@ -328,8 +349,11 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function pollOnce(): Promise<void> {
-    const accounts = await resolveAccounts();
+  // `signal` is the poller service's abort signal. Passing it down means a
+  // dispose (app close, plugin reload) tears the IMAP socket down now instead
+  // of leaving the poll running against a plugin instance that no longer exists.
+  async function pollOnce(signal?: AbortSignal): Promise<void> {
+    const accounts = await resolveAccounts(signal);
     if (accounts.length === 0) {
       throw Object.assign(new Error("Configure at least one Gmail account (address + app password secret) before polling."), {
         name: "NeedsConfigurationError",
@@ -338,6 +362,7 @@ export default async function plugin(bb: BbPluginApi) {
     const rules = loadRules();
     let anyNewMessages = false;
     for (const account of accounts) {
+      if (signal?.aborted) return;
       try {
         const cursorRow = db.prepare(`SELECT last_uid FROM account_cursors WHERE account = ?`).get(account.address) as
           | { last_uid: number }
@@ -399,11 +424,16 @@ export default async function plugin(bb: BbPluginApi) {
            ON CONFLICT(account) DO UPDATE SET last_uid = excluded.last_uid, last_polled_at = excluded.last_polled_at, last_error = NULL`,
         ).run(account.address, maxUid, new Date().toISOString());
       } catch (err) {
-        bb.log.error(`poll failed for ${account.address}: ${err}`);
+        // A teardown mid-poll fails the account with a closed-socket error.
+        // That is the shutdown working, not an account problem, so it must not
+        // be recorded as the account's last_error for the user to see later.
+        if (signal?.aborted) return;
+        const description = describeImapError(err);
+        bb.log.error(`poll failed for ${account.address}: ${description}`);
         db.prepare(
           `INSERT INTO account_cursors (account, last_uid, last_polled_at, last_error) VALUES (?, 0, ?, ?)
            ON CONFLICT(account) DO UPDATE SET last_polled_at = excluded.last_polled_at, last_error = excluded.last_error`,
-        ).run(account.address, new Date().toISOString(), String(err));
+        ).run(account.address, new Date().toISOString(), description);
       }
     }
     if (anyNewMessages) bb.realtime.publish("messages-changed", { reason: "new-mail" });
@@ -590,18 +620,26 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.service("poller", {
     async start(signal) {
       while (!signal.aborted) {
-        await pollOnce().catch((err) => {
-          if (err?.name === "NeedsConfigurationError") throw err;
-          bb.log.error(`poll cycle failed: ${err}`);
-        });
         const values = await settings.get();
+        if (values.autoPollEnabled) {
+          await pollOnce(signal).catch((err) => {
+            if (err?.name === "NeedsConfigurationError") throw err;
+            if (signal.aborted) return;
+            bb.log.error(`poll cycle failed: ${err}`);
+          });
+        }
         const minutes = Number.parseInt(values.pollIntervalMinutes ?? "5", 10) || 5;
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, minutes * 60_000);
-          signal.addEventListener("abort", () => {
+          const wake = () => {
             clearTimeout(timer);
+            // The sleep cleans up after itself: this loop runs for the life of
+            // the process, so a listener left behind on every cycle piles up on
+            // a signal that only ever fires once, at shutdown.
+            signal.removeEventListener("abort", wake);
             resolve();
-          }, { once: true });
+          };
+          const timer = setTimeout(wake, minutes * 60_000);
+          signal.addEventListener("abort", wake, { once: true });
         });
       }
     },
@@ -619,6 +657,11 @@ export default async function plugin(bb: BbPluginApi) {
       },
       { name: "rule-list", summary: "List triage rules", usage: "bb mail rule list" },
       { name: "rule-rm", summary: "Remove a triage rule", usage: "bb mail rule rm <rule-id>" },
+      {
+        name: "poll",
+        summary: "Poll configured inboxes once, on demand",
+        usage: "bb mail poll",
+      },
       {
         name: "digest",
         summary: "Print grouped unhandled mail",
@@ -673,6 +716,18 @@ export default async function plugin(bb: BbPluginApi) {
         return info.changes > 0
           ? { exitCode: 0, stdout: `Rule ${ruleId} removed.\n` }
           : { exitCode: 1, stderr: `No such rule: ${ruleId}\n` };
+      }
+
+      if (sub === "poll") {
+        try {
+          await pollOnce();
+          return { exitCode: 0, stdout: "Poll complete. Run `bb mail digest` to see results.\n" };
+        } catch (err) {
+          if ((err as { name?: string })?.name === "NeedsConfigurationError") {
+            return { exitCode: 1, stderr: `${(err as Error).message}\n` };
+          }
+          return { exitCode: 1, stderr: `Poll failed: ${err}\n` };
+        }
       }
 
       if (sub === "digest") {

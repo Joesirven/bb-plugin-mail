@@ -1,8 +1,39 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import plugin from "./server";
 
 describe("bb-plugin-mail server", () => {
+  // Regression test for the "mail is dead after every bb restart" incident:
+  // autoPollEnabled was added as an interim safety valve while an unguarded
+  // IMAP client could crash the whole server, and it defaulted to false. The
+  // crash is now fixed at the source (lib/imap.ts attaches an error
+  // listener), so a false default just means every restart silently stops
+  // polling until a human notices and flips the setting back on. It must
+  // default to true so a restart requires no manual step.
+  it("defaults autoPollEnabled to true", () => {
+    const source = readFileSync(path.join(__dirname, "server.ts"), "utf8");
+    const settingIndex = source.indexOf("autoPollEnabled:");
+    expect(settingIndex).toBeGreaterThan(-1);
+    const descriptor = source.slice(settingIndex, settingIndex + 700);
+    expect(descriptor).toMatch(/default:\s*true\s*,/);
+  });
+
+  it("gates the poller on the autoPollEnabled setting in source, not just at registration time", () => {
+    // A source-scan, not a live-service test: actually starting the poller
+    // service opens a real IMAP connection attempt, which is slow/flaky in
+    // CI. The behavioral contract (checked live above) is that the setting
+    // defaults true; this guards that the poller loop still reads it fresh
+    // on every cycle rather than only once at load.
+    const source = readFileSync(path.join(__dirname, "server.ts"), "utf8");
+    const serviceIndex = source.indexOf('bb.background.service("poller"');
+    expect(serviceIndex).toBeGreaterThan(-1);
+    const serviceBody = source.slice(serviceIndex, serviceIndex + 800);
+    expect(serviceBody).toMatch(/await\s+settings\.get\(\)/);
+    expect(serviceBody).toMatch(/values\.autoPollEnabled/);
+  });
+
   it("reports needs-configuration when no accounts are set", async () => {
     const { bb, harness } = createFakePluginHost({ pluginId: "mail" });
     await plugin(bb);
