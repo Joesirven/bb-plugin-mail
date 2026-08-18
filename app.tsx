@@ -107,10 +107,12 @@ function formatTime(value: string | null) {
   }).format(date);
 }
 
-function statusTone(status: MessageStatus): "default" | "secondary" | "outline" | "destructive" {
-  if (status === "escalated") return "default";
+// Notion Mail's row/reading-pane badges read as muted tinted pills, never a
+// saturated full-contrast fill — map every triage status to a low-contrast
+// variant accordingly (still token-driven, so this holds in light and dark).
+function statusTone(status: MessageStatus): "secondary" | "outline" {
+  if (status === "escalated") return "secondary";
   if (status === "ignored") return "secondary";
-  if (status === "unhandled") return "outline";
   return "outline";
 }
 
@@ -315,10 +317,10 @@ function MessageRow({
           <div className="flex items-center justify-between gap-2">
             <span className="truncate text-xs text-muted-foreground">{message.snippet}</span>
             <span className="flex shrink-0 items-center gap-1">
-              <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+              <Badge variant="outline" className="rounded-full px-1.5 py-0 text-[10px]">
                 {message.account}
               </Badge>
-              <Badge variant={statusTone(message.status)} className="px-1.5 py-0 text-[10px]">
+              <Badge variant={statusTone(message.status)} className="rounded-full px-1.5 py-0 text-[10px]">
                 {message.status}
               </Badge>
             </span>
@@ -547,9 +549,17 @@ function ReadingPane({
             <Icon name="ChevronDown" className="size-4" />
           </Button>
         </div>
-        <Button type="button" variant="ghost" size="icon" aria-label="Close message" onClick={onClose}>
-          <Icon name="X" className="size-4" />
-        </Button>
+        <div className="flex items-center gap-2">
+          {detail ? (
+            <Button type="button" size="sm" onClick={() => void draftReply()} disabled={isDrafting}>
+              <Icon name="Zap" className="size-4" />
+              {isDrafting ? "Starting…" : "Draft a reply"}
+            </Button>
+          ) : null}
+          <Button type="button" variant="ghost" size="icon" aria-label="Close message" onClick={onClose}>
+            <Icon name="X" className="size-4" />
+          </Button>
+        </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
@@ -572,13 +582,9 @@ function ReadingPane({
                   </dl>
                 </div>
               </div>
-              <div className="flex flex-col items-end gap-2">
-                <Badge variant={statusTone(detail.status)}>{detail.status}</Badge>
-                <Button type="button" size="sm" onClick={() => void draftReply()} disabled={isDrafting}>
-                  <Icon name="Zap" className="size-4" />
-                  {isDrafting ? "Starting…" : "Draft a reply"}
-                </Button>
-              </div>
+              <Badge variant={statusTone(detail.status)} className="rounded-full">
+                {detail.status}
+              </Badge>
             </div>
 
             {detail.appliedRule ? (

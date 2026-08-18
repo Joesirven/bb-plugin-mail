@@ -272,6 +272,43 @@ describe("Mail nav panel", () => {
     });
   });
 
+  it("clears the selection back to the inbox subPath on Escape", async () => {
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: `inbox/${encodeURIComponent(message.id)}` },
+      {
+        rpc: {
+          listAccounts: () => ({ accounts: [account] }),
+          listRules: () => ({ rules: [] }),
+          listDrafts: () => ({ drafts: [] }),
+          listMessages: () => ({ messages: [message, secondMessage], total: 2 }),
+          getMessageBody: () => ({
+            id: message.id,
+            account: message.account,
+            from: message.from,
+            to: "",
+            subject: message.subject,
+            receivedAt: message.receivedAt,
+            body: "Full message body text.",
+            status: message.status,
+            urgency: message.urgency,
+            appliedRule: null,
+          }),
+        },
+      },
+    );
+
+    await slot.findByText("Full message body text.");
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => {
+      expect(slot.navigateCalls).toContainEqual({
+        method: "toPluginPanel",
+        path: "mail",
+        options: { subPath: "" },
+      });
+    });
+  });
+
   it("starts a draft-reply thread and navigates to it", async () => {
     const draftReplyThread = vi.fn(() => ({ threadId: "thr_new" }));
     const slot = renderSlot(
