@@ -152,15 +152,19 @@ function SelectField<T extends string>({
 // ---------------------------------------------------------------------------
 // Sub-routing — the panel owns /plugins/mail/mail/*, so sub-navigation lives
 // in the route's subPath: "" (inbox), "triage", "drafts", "accounts",
-// "inbox/<message-id>" for the detail view. Deep-linkable, and browser
-// back/forward walks panel-internal history.
+// "inbox/<message-id>" for a message opened in the inbox's reading pane.
+// Opening a message is a split-view selection, not a page change — the tab
+// bar and message list stay mounted, matching Notion Mail's "side peek"
+// (see research notes: side peek / center peek / full page are Notion's own
+// three reading-pane modes; side peek — persistent split, list stays visible
+// — is the one this mirrors). Still deep-linkable, and browser back/forward
+// walks panel-internal history.
 // ---------------------------------------------------------------------------
 
 const PANEL_PATH = "mail";
 
 type Route =
-  | { view: "inbox" }
-  | { view: "message"; id: string }
+  | { view: "inbox"; messageId: string | null }
   | { view: "triage" }
   | { view: "drafts" }
   | { view: "accounts" };
@@ -168,20 +172,18 @@ type Route =
 function parseSubPath(subPath: string): Route {
   const parts = subPath.split("/").filter((p) => p.length > 0);
   if (parts[0] === "inbox" && parts.length >= 2) {
-    return { view: "message", id: decodeURIComponent(parts.slice(1).join("/")) };
+    return { view: "inbox", messageId: decodeURIComponent(parts.slice(1).join("/")) };
   }
   if (parts[0] === "triage") return { view: "triage" };
   if (parts[0] === "drafts") return { view: "drafts" };
   if (parts[0] === "accounts") return { view: "accounts" };
-  return { view: "inbox" };
+  return { view: "inbox", messageId: null };
 }
 
 function routeToSubPath(route: Route): string {
   switch (route.view) {
     case "inbox":
-      return "";
-    case "message":
-      return `inbox/${encodeURIComponent(route.id)}`;
+      return route.messageId ? `inbox/${encodeURIComponent(route.messageId)}` : "";
     case "triage":
       return "triage";
     case "drafts":
@@ -259,15 +261,82 @@ function useDrafts(): { drafts: DraftSummary[] | null; error: string | null; ref
 }
 
 // ---------------------------------------------------------------------------
-// Inbox tab.
+// Inbox tab — a persistent split view: message list on the left, reading
+// pane on the right. Selecting a row never navigates away from the list
+// (Notion Mail's "side peek" reading-pane mode); it just updates which
+// message the reading pane shows, deep-linked into the subPath so it's still
+// bookmarkable and survives a reload.
 // ---------------------------------------------------------------------------
 
-function InboxTab({
+function initials(from: string): string {
+  const name = from.split("@")[0] ?? from;
+  const parts = name.split(/[.\s_-]+/).filter(Boolean);
+  const letters = parts.length >= 2 ? `${parts[0]![0]}${parts[1]![0]}` : name.slice(0, 2);
+  return letters.toUpperCase();
+}
+
+function Avatar({ from }: { from: string }) {
+  return (
+    <div
+      aria-hidden="true"
+      className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground"
+    >
+      {initials(from)}
+    </div>
+  );
+}
+
+function MessageRow({
+  message,
+  selected,
+  onSelect,
+}: {
+  message: MessageSummary;
+  selected: boolean;
+  onSelect(): void;
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-current={selected ? "true" : undefined}
+        className={`flex w-full gap-2.5 border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-muted/40 ${
+          selected ? "bg-muted" : ""
+        }`}
+      >
+        <Avatar from={message.from} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="truncate text-sm font-semibold text-foreground">{message.from}</span>
+            <span className="shrink-0 text-xs text-muted-foreground">{formatTime(message.receivedAt)}</span>
+          </div>
+          <div className="truncate text-sm text-foreground">{message.subject || "(no subject)"}</div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="truncate text-xs text-muted-foreground">{message.snippet}</span>
+            <span className="flex shrink-0 items-center gap-1">
+              <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+                {message.account}
+              </Badge>
+              <Badge variant={statusTone(message.status)} className="px-1.5 py-0 text-[10px]">
+                {message.status}
+              </Badge>
+            </span>
+          </div>
+        </div>
+      </button>
+    </li>
+  );
+}
+
+function MessageListPane({
   accounts,
-  onOpenMessage,
+  selectedId,
+  onSelect,
 }: {
   accounts: AccountHealth[];
-  onOpenMessage(id: string): void;
+  selectedId: string | null;
+  onSelect(id: string): void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [account, setAccount] = React.useState("all");
@@ -277,6 +346,7 @@ function InboxTab({
   const [messages, setMessages] = React.useState<MessageSummary[]>([]);
   const [total, setTotal] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
+  const listRef = React.useRef<HTMLUListElement>(null);
 
   const refresh = React.useCallback(
     (nextOffset: number) => {
@@ -307,97 +377,110 @@ function InboxTab({
 
   useRealtime("messages-changed", () => refresh(0));
 
+  // Notion Mail keyboard nav: j/k or arrow keys move the selection, Escape
+  // clears it back to the empty reading-pane state. Ignored while typing in
+  // the search box or a select so filter input isn't hijacked.
+  React.useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target && /^(input|select|textarea)$/i.test(target.tagName)) return;
+      if (messages.length === 0) return;
+
+      if (event.key === "Escape") {
+        onSelect("");
+        return;
+      }
+      const isNext = event.key === "j" || event.key === "ArrowDown";
+      const isPrev = event.key === "k" || event.key === "ArrowUp";
+      if (!isNext && !isPrev) return;
+      event.preventDefault();
+      const currentIndex = messages.findIndex((m) => m.id === selectedId);
+      const nextIndex = isNext
+        ? Math.min(messages.length - 1, currentIndex + 1)
+        : Math.max(0, currentIndex === -1 ? 0 : currentIndex - 1);
+      const next = messages[nextIndex];
+      if (next) onSelect(next.id);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [messages, selectedId, onSelect]);
+
+  React.useEffect(() => {
+    if (!selectedId || !listRef.current) return;
+    listRef.current.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(selectedId)}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [selectedId]);
+
   const accountOptions = [
     { value: "all", label: "All accounts" },
     ...accounts.map((a) => ({ value: a.address, label: a.address })),
   ];
 
   return (
-    <div className="grid gap-3">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-        <label className="grid gap-1.5">
-          <span className="text-xs font-medium text-muted-foreground">Search</span>
-          <Input
-            value={query}
-            onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="Subject, sender, or snippet"
-            className="w-64"
+    <div className="flex h-full min-w-0 flex-col border-r border-border">
+      <div className="flex shrink-0 flex-col gap-2 border-b border-border p-2.5">
+        <Input
+          value={query}
+          onChange={(event) => setQuery(event.currentTarget.value)}
+          placeholder="Search mail"
+          aria-label="Search"
+        />
+        <div className="flex gap-2">
+          <SelectField label="Account" value={account} options={accountOptions} onChange={setAccount} className="grid flex-1 gap-1" />
+          <SelectField<MessageStatus | "all">
+            label="Triage state"
+            value={status}
+            options={statusFilterOptions}
+            onChange={setStatus}
+            className="grid flex-1 gap-1"
           />
-        </label>
-        <div className="grid grid-cols-2 gap-2">
-          <SelectField label="Account" value={account} options={accountOptions} onChange={setAccount} />
-          <SelectField<MessageStatus | "all"> label="Triage state" value={status} options={statusFilterOptions} onChange={setStatus} />
         </div>
       </div>
 
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {error ? <p className="p-3 text-sm text-destructive">{error}</p> : null}
 
-      {messages.length === 0 ? (
-        <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
-          No messages match the current filters.
-        </div>
-      ) : (
-        <div className="overflow-hidden rounded-md border border-border">
-          <table className="w-full table-fixed border-collapse text-sm">
-            <thead className="bg-muted/40 text-left text-xs font-medium uppercase text-muted-foreground">
-              <tr>
-                <th className="w-[16%] px-3 py-2">Sender</th>
-                <th className="w-[12%] px-3 py-2">Account</th>
-                <th className="w-[28%] px-3 py-2">Subject</th>
-                <th className="w-[20%] px-3 py-2">Snippet</th>
-                <th className="w-[12%] px-3 py-2">Received</th>
-                <th className="w-[12%] px-3 py-2">Triage</th>
-              </tr>
-            </thead>
-            <tbody>
-              {messages.map((message) => (
-                <tr
-                  key={message.id}
-                  className="cursor-pointer border-t border-border align-top hover:bg-muted/30"
-                  onClick={() => onOpenMessage(message.id)}
-                >
-                  <td className="truncate px-3 py-3 font-medium text-foreground">{message.from}</td>
-                  <td className="truncate px-3 py-3 text-muted-foreground">{message.account}</td>
-                  <td className="px-3 py-3">
-                    <div className="truncate text-foreground">{message.subject || "(no subject)"}</div>
-                    <div className="mt-1 text-xs text-muted-foreground">{message.urgency} urgency</div>
-                  </td>
-                  <td className="px-3 py-3 text-muted-foreground">
-                    <div className="line-clamp-2">{message.snippet}</div>
-                  </td>
-                  <td className="px-3 py-3 text-muted-foreground">{formatTime(message.receivedAt)}</td>
-                  <td className="px-3 py-3">
-                    <Badge variant={statusTone(message.status)}>{message.status}</Badge>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+        {messages.length === 0 && !error ? (
+          <div className="p-6 text-center text-sm text-muted-foreground">No messages match the current filters.</div>
+        ) : (
+          <ul ref={listRef}>
+            {messages.map((message) => (
+              <div key={message.id} data-message-id={message.id}>
+                <MessageRow message={message} selected={message.id === selectedId} onSelect={() => onSelect(message.id)} />
+              </div>
+            ))}
+          </ul>
+        )}
 
-      {messages.length < total ? (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="justify-self-start"
-          onClick={() => {
-            const next = offset + MESSAGE_PAGE_SIZE;
-            setOffset(next);
-            refresh(next);
-          }}
-        >
-          Load more ({messages.length} of {total})
-        </Button>
-      ) : null}
+        {messages.length < total ? (
+          <div className="p-2.5">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={() => {
+                const next = offset + MESSAGE_PAGE_SIZE;
+                setOffset(next);
+                refresh(next);
+              }}
+            >
+              Load more ({messages.length} of {total})
+            </Button>
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Message detail view.
-// ---------------------------------------------------------------------------
+function ReadingPaneEmptyState() {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-sm text-muted-foreground">
+      <Icon name="MailOpen" className="size-8 text-muted-foreground/60" />
+      <p>Select a message to read it</p>
+    </div>
+  );
+}
 
 interface MessageDetail {
   id: string;
@@ -412,7 +495,19 @@ interface MessageDetail {
   appliedRule: Rule | null;
 }
 
-function MessageDetailView({ id, onBack }: { id: string; onBack(): void }) {
+function ReadingPane({
+  id,
+  onClose,
+  onNavigate,
+  hasPrevious,
+  hasNext,
+}: {
+  id: string;
+  onClose(): void;
+  onNavigate(direction: "previous" | "next"): void;
+  hasPrevious: boolean;
+  hasNext: boolean;
+}) {
   const rpc = useRpc<typeof rpcContract>();
   const bbNavigate = useBbNavigate();
   const [detail, setDetail] = React.useState<MessageDetail | null>(null);
@@ -442,51 +537,123 @@ function MessageDetailView({ id, onBack }: { id: string; onBack(): void }) {
   }
 
   return (
-    <div className="grid gap-3">
-      <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={onBack}>
-        <Icon name="ChevronLeft" className="size-4" />
-        Back to inbox
-      </Button>
-
-      {error ? <div className="rounded-md border border-destructive/40 p-4 text-sm text-destructive">{error}</div> : null}
-
-      {!detail && !error ? <p className="text-sm text-muted-foreground">Loading message…</p> : null}
-
-      {detail ? (
-        <div className="grid gap-4 rounded-md border border-border p-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h2 className="text-base font-semibold text-foreground">{detail.subject || "(no subject)"}</h2>
-              <dl className="mt-2 grid gap-1 text-sm text-muted-foreground">
-                <div><span className="font-medium text-foreground">From:</span> {detail.from}</div>
-                {detail.to ? <div><span className="font-medium text-foreground">To:</span> {detail.to}</div> : null}
-                <div><span className="font-medium text-foreground">Account:</span> {detail.account}</div>
-                <div><span className="font-medium text-foreground">Received:</span> {formatTime(detail.receivedAt)}</div>
-              </dl>
-            </div>
-            <div className="flex flex-col items-end gap-2">
-              <Badge variant={statusTone(detail.status)}>{detail.status}</Badge>
-              <Button type="button" size="sm" onClick={() => void draftReply()} disabled={isDrafting}>
-                <Icon name="Zap" className="size-4" />
-                {isDrafting ? "Starting…" : "Draft a reply"}
-              </Button>
-            </div>
-          </div>
-
-          {detail.appliedRule ? (
-            <div className="rounded-md bg-muted/40 p-3 text-sm">
-              <span className="font-medium text-foreground">Applied rule:</span>{" "}
-              {detail.appliedRule.matchType} = {detail.appliedRule.matchValue} → {detail.appliedRule.action} ({detail.appliedRule.urgency})
-            </div>
-          ) : (
-            <div className="rounded-md bg-muted/40 p-3 text-sm text-muted-foreground">No rule matched — default digest handling.</div>
-          )}
-
-          <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-background p-3 text-sm text-foreground">
-            {detail.body || "(empty body)"}
-          </pre>
+    <div className="flex h-full min-w-0 flex-col">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border p-2">
+        <div className="flex items-center gap-1">
+          <Button type="button" variant="ghost" size="icon" aria-label="Previous message" disabled={!hasPrevious} onClick={() => onNavigate("previous")}>
+            <Icon name="ChevronUp" className="size-4" />
+          </Button>
+          <Button type="button" variant="ghost" size="icon" aria-label="Next message" disabled={!hasNext} onClick={() => onNavigate("next")}>
+            <Icon name="ChevronDown" className="size-4" />
+          </Button>
         </div>
-      ) : null}
+        <Button type="button" variant="ghost" size="icon" aria-label="Close message" onClick={onClose}>
+          <Icon name="X" className="size-4" />
+        </Button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        {error ? <div className="rounded-md border border-destructive/40 p-4 text-sm text-destructive">{error}</div> : null}
+
+        {!detail && !error ? <p className="text-sm text-muted-foreground">Loading message…</p> : null}
+
+        {detail ? (
+          <div className="grid gap-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex min-w-0 gap-3">
+                <Avatar from={detail.from} />
+                <div className="min-w-0">
+                  <h2 className="text-base font-semibold text-foreground">{detail.subject || "(no subject)"}</h2>
+                  <dl className="mt-1 grid gap-0.5 text-sm text-muted-foreground">
+                    <div><span className="font-medium text-foreground">From:</span> {detail.from}</div>
+                    {detail.to ? <div><span className="font-medium text-foreground">To:</span> {detail.to}</div> : null}
+                    <div><span className="font-medium text-foreground">Account:</span> {detail.account}</div>
+                    <div><span className="font-medium text-foreground">Received:</span> {formatTime(detail.receivedAt)}</div>
+                  </dl>
+                </div>
+              </div>
+              <div className="flex flex-col items-end gap-2">
+                <Badge variant={statusTone(detail.status)}>{detail.status}</Badge>
+                <Button type="button" size="sm" onClick={() => void draftReply()} disabled={isDrafting}>
+                  <Icon name="Zap" className="size-4" />
+                  {isDrafting ? "Starting…" : "Draft a reply"}
+                </Button>
+              </div>
+            </div>
+
+            {detail.appliedRule ? (
+              <div className="rounded-md bg-muted/40 p-3 text-sm">
+                <span className="font-medium text-foreground">Applied rule:</span>{" "}
+                {detail.appliedRule.matchType} = {detail.appliedRule.matchValue} → {detail.appliedRule.action} ({detail.appliedRule.urgency})
+              </div>
+            ) : (
+              <div className="rounded-md bg-muted/40 p-3 text-sm text-muted-foreground">No rule matched — default digest handling.</div>
+            )}
+
+            <pre className="whitespace-pre-wrap rounded-md border border-border bg-background p-3 text-sm text-foreground">
+              {detail.body || "(empty body)"}
+            </pre>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function InboxSplitView({
+  accounts,
+  selectedId,
+  onSelect,
+}: {
+  accounts: AccountHealth[];
+  selectedId: string | null;
+  onSelect(id: string | null): void;
+}) {
+  // The list pane owns the loaded `messages` array; the split view only
+  // needs to know the ordered id sequence for prev/next, so it re-derives
+  // that from the same rpc call rather than threading state through props.
+  const rpc = useRpc<typeof rpcContract>();
+  const [orderedIds, setOrderedIds] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    rpc.call("listMessages", { offset: 0, limit: MESSAGE_PAGE_SIZE }).then(
+      (result) => setOrderedIds(result.messages.map((m) => m.id)),
+      () => {},
+    );
+  }, [rpc]);
+  useRealtime("messages-changed", () => {
+    rpc.call("listMessages", { offset: 0, limit: MESSAGE_PAGE_SIZE }).then(
+      (result) => setOrderedIds(result.messages.map((m) => m.id)),
+      () => {},
+    );
+  });
+
+  const index = selectedId ? orderedIds.indexOf(selectedId) : -1;
+
+  function navigate(direction: "previous" | "next") {
+    if (index === -1) return;
+    const nextIndex = direction === "previous" ? index - 1 : index + 1;
+    const next = orderedIds[nextIndex];
+    if (next) onSelect(next);
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 overflow-hidden rounded-md border border-border">
+      <div className="w-[360px] shrink-0">
+        <MessageListPane accounts={accounts} selectedId={selectedId} onSelect={(id) => onSelect(id || null)} />
+      </div>
+      <div className="min-w-0 flex-1">
+        {selectedId ? (
+          <ReadingPane
+            id={selectedId}
+            onClose={() => onSelect(null)}
+            onNavigate={navigate}
+            hasPrevious={index > 0}
+            hasNext={index !== -1 && index < orderedIds.length - 1}
+          />
+        ) : (
+          <ReadingPaneEmptyState />
+        )}
+      </div>
     </div>
   );
 }
@@ -864,38 +1031,39 @@ function MailPanel({ subPath }: PluginNavPanelProps) {
     return <NeedsConfiguration />;
   }
 
-  const activeTab = route.view === "message" ? "inbox" : route.view;
-
   return (
-    <div className="min-h-full overflow-auto p-4 md:p-5">
-      <div className="mx-auto grid w-full max-w-6xl gap-4">
-        {route.view !== "message" ? (
-          <Tabs
-            value={activeTab}
-            onValueChange={(value) => {
-              if (value === "inbox" || value === "triage" || value === "drafts" || value === "accounts") {
-                navigate({ view: value });
-              }
-            }}
-          >
-            <TabsList>
-              <TabsTrigger value="inbox">Inbox</TabsTrigger>
-              <TabsTrigger value="triage">Triage</TabsTrigger>
-              <TabsTrigger value="drafts">Drafts</TabsTrigger>
-              <TabsTrigger value="accounts">Accounts</TabsTrigger>
-            </TabsList>
-          </Tabs>
-        ) : null}
+    <div className="flex h-full min-h-0 flex-col gap-4 p-4 md:p-5">
+      <div className="mx-auto w-full max-w-6xl shrink-0">
+        <Tabs
+          value={route.view}
+          onValueChange={(value) => {
+            if (value === "inbox") navigate({ view: "inbox", messageId: null });
+            else if (value === "triage" || value === "drafts" || value === "accounts") navigate({ view: value });
+          }}
+        >
+          <TabsList>
+            <TabsTrigger value="inbox">Inbox</TabsTrigger>
+            <TabsTrigger value="triage">Triage</TabsTrigger>
+            <TabsTrigger value="drafts">Drafts</TabsTrigger>
+            <TabsTrigger value="accounts">Accounts</TabsTrigger>
+          </TabsList>
+        </Tabs>
+      </div>
 
+      <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col">
         {route.view === "inbox" ? (
-          <InboxTab accounts={configuredAccounts} onOpenMessage={(id) => navigate({ view: "message", id })} />
-        ) : null}
-        {route.view === "message" ? (
-          <MessageDetailView id={route.id} onBack={() => navigate({ view: "inbox" })} />
-        ) : null}
-        {route.view === "triage" ? <TriageTab rules={rules} onChanged={refetchRules} /> : null}
-        {route.view === "drafts" ? <DraftsTab drafts={drafts} /> : null}
-        {route.view === "accounts" ? <AccountsTab accounts={accounts} /> : null}
+          <InboxSplitView
+            accounts={configuredAccounts}
+            selectedId={route.messageId}
+            onSelect={(id) => navigate({ view: "inbox", messageId: id })}
+          />
+        ) : (
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {route.view === "triage" ? <TriageTab rules={rules} onChanged={refetchRules} /> : null}
+            {route.view === "drafts" ? <DraftsTab drafts={drafts} /> : null}
+            {route.view === "accounts" ? <AccountsTab accounts={accounts} /> : null}
+          </div>
+        )}
       </div>
     </div>
   );

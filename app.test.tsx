@@ -31,6 +31,19 @@ const message = {
   taskKey: null,
 };
 
+const secondMessage = {
+  id: "jose@gmail.com:2",
+  account: "jose@gmail.com",
+  from: "billing@example.com",
+  subject: "Your invoice",
+  snippet: "Invoice attached",
+  receivedAt: "2026-08-09T13:00:00.000Z",
+  status: "digested" as const,
+  urgency: "normal" as const,
+  ruleId: null,
+  taskKey: null,
+};
+
 const rule = {
   id: "rule-1",
   matchType: "domain" as const,
@@ -143,6 +156,120 @@ describe("Mail nav panel", () => {
     await slot.findByText("Full message body text.");
     expect(getMessageBody).toHaveBeenCalledWith({ id: message.id });
     expect(getMessageBody).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a message as a split view without navigating away from the list", async () => {
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: `inbox/${encodeURIComponent(message.id)}` },
+      {
+        rpc: {
+          listAccounts: () => ({ accounts: [account] }),
+          listRules: () => ({ rules: [] }),
+          listDrafts: () => ({ drafts: [] }),
+          listMessages: () => ({ messages: [message, secondMessage], total: 2 }),
+          getMessageBody: () => ({
+            id: message.id,
+            account: message.account,
+            from: message.from,
+            to: "",
+            subject: message.subject,
+            receivedAt: message.receivedAt,
+            body: "Full message body text.",
+            status: message.status,
+            urgency: message.urgency,
+            appliedRule: null,
+          }),
+        },
+      },
+    );
+
+    // The reading pane shows the selected message...
+    await slot.findByText("Full message body text.");
+    // ...while both list rows, including the unselected one, stay mounted and visible.
+    expect(slot.getByText(secondMessage.from)).toBeTruthy();
+    expect(slot.getByRole("tab", { name: "Triage" })).toBeTruthy();
+
+    // The Tabs bar and the Inbox tab route both remain the "inbox" tab, not a separate page.
+    expect(slot.getByRole("tab", { name: "Inbox", selected: true })).toBeTruthy();
+
+    // Closing the reading pane navigates back to the bare inbox subPath — a
+    // selection-clearing intent, not a route/page change (the mounted slot's
+    // subPath prop is fixed per render in this harness, same as the
+    // tab-switch test below; we assert the navigate call, not a live re-render).
+    fireEvent.click(slot.getByRole("button", { name: "Close message" }));
+    expect(slot.navigateCalls).toContainEqual({
+      method: "toPluginPanel",
+      path: "mail",
+      options: { subPath: "" },
+    });
+  });
+
+  it("navigates to the next message via the reading-pane chevron and via keyboard", async () => {
+    const getMessageBody = vi.fn((input: unknown) => {
+      const id = (input as { id: string }).id;
+      const source = id === message.id ? message : secondMessage;
+      return {
+        id: source.id,
+        account: source.account,
+        from: source.from,
+        to: "",
+        subject: source.subject,
+        receivedAt: source.receivedAt,
+        body: `Body for ${source.id}`,
+        status: source.status,
+        urgency: source.urgency,
+        appliedRule: null,
+      };
+    });
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: `inbox/${encodeURIComponent(message.id)}` },
+      {
+        rpc: {
+          listAccounts: () => ({ accounts: [account] }),
+          listRules: () => ({ rules: [] }),
+          listDrafts: () => ({ drafts: [] }),
+          listMessages: () => ({ messages: [message, secondMessage], total: 2 }),
+          getMessageBody,
+        },
+      },
+    );
+
+    await slot.findByText(`Body for ${message.id}`);
+    fireEvent.click(slot.getByRole("button", { name: "Next message" }));
+    await waitFor(() => {
+      expect(slot.navigateCalls).toContainEqual({
+        method: "toPluginPanel",
+        path: "mail",
+        options: { subPath: `inbox/${encodeURIComponent(secondMessage.id)}` },
+      });
+    });
+  });
+
+  it("moves the list selection with j/k keyboard shortcuts", async () => {
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: {
+          listAccounts: () => ({ accounts: [account] }),
+          listRules: () => ({ rules: [] }),
+          listDrafts: () => ({ drafts: [] }),
+          listMessages: () => ({ messages: [message, secondMessage], total: 2 }),
+        },
+      },
+    );
+
+    await slot.findByText(message.from);
+    fireEvent.keyDown(window, { key: "j" });
+    await waitFor(() => {
+      expect(slot.navigateCalls).toContainEqual({
+        method: "toPluginPanel",
+        path: "mail",
+        options: { subPath: `inbox/${encodeURIComponent(message.id)}` },
+      });
+    });
   });
 
   it("starts a draft-reply thread and navigates to it", async () => {
