@@ -4,6 +4,28 @@ An email agent over multiple Gmail accounts: it triages incoming mail
 against rules, escalates what matters as internal bb tasks, and drafts
 replies for a human to review.
 
+## How it works
+
+```mermaid
+flowchart LR
+    IN["Gmail inboxes<br/>(configured accounts)"] -->|"IMAP read-only poll"| DB[("SQLite - metadata<br/>and snippet only")]
+    DB --> R{"Rules engine<br/>first match wins"}
+    R -->|"escalate"| T["bb task in MAIL project<br/>sender, subject, trace id"]
+    R -->|"digest - default"| D["bb mail digest<br/>grouped by account"]
+    R -->|"ignore"| X["Excluded from digest"]
+    H["Human writes the reply body"] --> DR["bb mail draft<br/>builds threading headers"]
+    DR -->|"IMAP APPEND -<br/>storage, not send"| GD[("[Gmail]/Drafts")]
+    GD -->|"owner reviews and sends<br/>from their own Gmail"| OUT["Sent by the human"]
+    NS["no-send.test.ts scans every file<br/>for send-shaped code"] -.->|"fails the build"| DR
+
+    classDef core fill:#005032,stroke:#0D1016,color:#FAFAF9
+    classDef store fill:#0D1016,stroke:#005032,color:#FAFAF9
+    classDef guard fill:#F5C518,stroke:#0D1016,color:#0D1016
+    class IN,H,DR,T,D core
+    class DB,GD store
+    class R,NS,X,OUT guard
+```
+
 ## Hard invariant: this plugin never sends email
 
 There is no send/submit code path anywhere in this plugin — no SMTP client,
